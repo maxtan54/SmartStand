@@ -39,6 +39,7 @@ smartstand/
     │   │       ├── page.tsx            # активні столи
     │   │       ├── requests/page.tsx   # сервісні запити
     │   │       ├── orders/page.tsx     # замовлення
+    │   │       ├── orders/new/page.tsx # створення замовлення (офіціант)
     │   │       └── (admin)/            # layout: requireAdmin
     │   │           ├── menu/page.tsx
     │   │           ├── tables/page.tsx
@@ -50,7 +51,7 @@ smartstand/
     │   │   └── table/[tableNumber]/route.ts  # валідація токена → cookie → redirect
     │   ├── api/
     │   │   ├── service-requests/route.ts
-    │   │   ├── orders/route.ts
+    │   │   ├── table-orders/route.ts   # read-only список замовленого (гість)
     │   │   ├── hardware-call/route.ts
     │   │   └── uploads/presign/route.ts
     │   ├── domain-not-found/page.tsx
@@ -58,7 +59,7 @@ smartstand/
     │   └── globals.css
     ├── components/
     │   ├── ui/                     # shadcn
-    │   ├── guest/                  # menu, cart, service-buttons
+    │   ├── guest/                  # menu, service-buttons, table-orders
     │   └── dashboard/              # tables-board, requests, orders, realtime-provider
     └── lib/
         ├── supabase/
@@ -87,7 +88,7 @@ smartstand/
 | `menu_categories` | Категорії меню, `sort_order`, `is_active` | → restaurants |
 | `menu_items` | Страви: ціна, фото (R2), `is_available`, `sort_order` | → restaurants, menu_categories |
 | `service_requests` | Виклики: `call_waiter`/`request_bill`, `digital`/`hardware`, `open`/`handled` | → restaurants, tables, staff_users |
-| `orders` | Замовлення: `status`, `payment_status`, коментар гостя | → restaurants, tables, staff_users |
+| `orders` | Замовлення столу — формує офіціант: `status`, `payment_status`, нотатка `note` | → restaurants, tables, staff_users |
 | `order_items` | Позиції зі **snapshot** назви та ціни (редаговані офіціантом) | → orders, menu_items, restaurants |
 | `hardware_buttons` | Фізичні кнопки: `button_id`, `secret`, прив'язка до столу і типу запиту | → restaurants, tables |
 
@@ -96,19 +97,19 @@ Enum-типи: `staff_role` (admin, waiter), `table_status` (free, occupied), `s
 ### 0.4 Ключові архітектурні рішення (безпека та масштабування)
 
 1. **Tenant resolution у Middleware.** Три класи хостів: root-домен (dashboard + шляхи `/r/[slug]/...`), піддомен `{slug}.platform.com` і custom-домен (lookup у `restaurant_domains` з in-memory кешем TTL 60s). Піддомени/custom-домени rewrite'яться на `/r/[slug]/...`; контекст доступний маршрутам через сегмент `[slug]` та request headers `x-restaurant-slug` / `x-tenant-host`. Додавання нового ресторану = лише дані, нуль змін коду.
-2. **Модель безпеки гостя.** Гість анонімний. QR/NFC-токен (`tables.access_token`, 48 hex) валідується server-side і обмінюється на **HMAC-підписану httpOnly cookie** `ss_table` (TTL 4 год). Усі guest-write API (`/api/service-requests`, `/api/orders`) читають контекст ресторану/столу ВИКЛЮЧНО з cookie й пишуть через service role. Жодних anon INSERT-політик у БД.
+2. **Модель безпеки гостя.** Гість анонімний. QR/NFC-токен (`tables.access_token`, 48 hex) валідується server-side і обмінюється на **HMAC-підписану httpOnly cookie** `ss_table` (TTL 4 год). Гостьові API — запис `/api/service-requests` і читання `GET /api/table-orders` — беруть контекст ресторану/столу ВИКЛЮЧНО з cookie й працюють через service role. Жодних anon-політик на операційні таблиці.
 3. **RLS-модель.** `anon` читає лише публічні дані (активні ресторани, брендинг, домени, доступне меню). Персонал — через security definer хелпери `is_staff_of()` / `is_admin_of()` (без RLS-рекурсії). Таблиця `tables` НЕ доступна anon (містить токени). Матриця доступів визначена в задачах 1.2 і 1.3.
 4. **Realtime.** Один канал на ресторан: `supabase.channel('restaurant:{id}')` + `postgres_changes` з фільтром `restaurant_id=eq.{id}` по таблицях `service_requests`, `orders`, `order_items`, `tables`. RLS гарантує, що клієнт отримує події лише свого ресторану.
-5. **Ціноутворення.** Сервер ніколи не довіряє цінам з клієнта: `order_items` зберігає snapshot назви/ціни з БД на момент замовлення; офіціант редагує snapshot вручну. Видалення страви з меню не ламає історію (FK `on delete set null`).
+5. **Замовлення формує офіціант.** Гість озвучує замовлення (або кличе офіціанта кнопкою), офіціант складає його в дашборді з меню; гість бачить read-only список замовленого та суму на своїй QR-сторінці. `order_items` зберігає snapshot назви/ціни на момент створення: редагування меню не змінює відкриті замовлення, а ручні коригування цін офіціантом — контрольована операція під RLS. Видалення страви не ламає історію (FK `on delete set null`).
 6. **Денормалізація `restaurant_id`** у кожній tenant-таблиці (включно з `order_items`) + композитні індекси `(restaurant_id, status, created_at)` — прості RLS-політики, дешеві realtime-фільтри, готовність до шардування в майбутньому.
 7. **Stateless-додаток.** Уся довгоживуча взаємодія — у Supabase (дані, сесії, realtime); Vercel-функції безстанові й масштабуються горизонтально; медіа — на R2 (CDN). Версіоновані SQL-міграції через Supabase CLI + згенеровані TypeScript-типи.
 8. **Антидубль на рівні БД.** Частковий унікальний індекс `(table_id, type) WHERE status='open'` у `service_requests` — жодних дублів викликів від спаму цифрової чи фізичної кнопки, незалежно від шляху створення.
 
 ### 0.5 Порядок виконання і залежності
 
-Задачі виконуються послідовно за нумерацією. Критичний шлях: `1.1 → 1.2 → 1.3 → 1.4 → 1.5 → 1.6 → 1.7 → 2.1 → 2.2 → 2.3 → 2.4 → 2.5 → 3.1 → 3.2 → 3.3 → 3.4 → 3.5 → 3.6 → 3.7 → 3.8 → 3.9 → 4.1 → 4.2 → 4.3 → 4.4 → 4.5`.
+Задачі виконуються послідовно за нумерацією. Критичний шлях: `1.1 → 1.2 → 1.3 → 1.4 → 1.5 → 1.6 → 1.7 → 2.1 → 2.2 → 2.3 → 2.4 → 3.1 → 3.2 → 3.3 → 3.4 → 3.5 → 3.6 → 3.7 → 3.8 → 3.9 → 4.1 → 4.2 → 4.3 → 4.4 → 4.5`.
 
-Допустимі відхилення: 3.7–3.9 незалежні одна від одної (після 3.1); 4.1–4.2 незалежні від 4.3–4.4; задача 4.5 — завжди остання (реліз-gate).
+Допустимі відхилення: 3.7–3.9 незалежні одна від одної (після 3.1); 4.1–4.2 незалежні від 4.3–4.4; задача 4.5 — завжди остання (реліз-gate). Замовлення в системі створює офіціант (задача 3.5); гостьовий read-only перегляд замовленого (2.3) у фазі 2 розробляється на seed-замовленнях з 1.4 і наживо наповнюється після 3.5.
 
 ---
 
@@ -332,7 +333,7 @@ Enum-типи: `staff_role` (admin, waiter), `table_status` (free, occupied), `s
     table_id       uuid not null references tables(id) on delete cascade,
     status         order_status not null default 'new',
     payment_status payment_status not null default 'unpaid',
-    guest_comment  text,
+    note           text,                          -- нотатка офіціанта до замовлення
     created_at     timestamptz not null default now(),
     closed_at      timestamptz,
     closed_by      uuid references staff_users(id) on delete set null
@@ -397,7 +398,7 @@ Enum-типи: `staff_role` (admin, waiter), `table_status` (free, occupied), `s
   create policy "admin_write_items" on menu_items
     for all to authenticated using (is_admin_of(restaurant_id)) with check (is_admin_of(restaurant_id));
 
-  -- service_requests / orders / order_items: INSERT лише через server API (service_role)
+  -- service_requests: INSERT лише через guest/hardware API (service_role)
   create policy "staff_select_requests" on service_requests
     for select using (is_staff_of(restaurant_id));
   create policy "staff_update_requests" on service_requests
@@ -407,6 +408,13 @@ Enum-типи: `staff_role` (admin, waiter), `table_status` (free, occupied), `s
     for select using (is_staff_of(restaurant_id));
   create policy "staff_update_orders" on orders
     for update using (is_staff_of(restaurant_id)) with check (is_staff_of(restaurant_id));
+  -- Замовлення створює офіціант зі свого дашборда (задача 3.5)
+  create policy "staff_insert_orders" on orders
+    for insert with check (
+      is_staff_of(restaurant_id)
+      and exists (select 1 from tables t
+                  where t.id = orders.table_id and t.restaurant_id = orders.restaurant_id)
+    );
 
   create policy "staff_select_order_items" on order_items
     for select using (is_staff_of(restaurant_id));
@@ -414,6 +422,12 @@ Enum-типи: `staff_role` (admin, waiter), `table_status` (free, occupied), `s
     for update using (is_staff_of(restaurant_id)) with check (is_staff_of(restaurant_id));
   create policy "staff_delete_order_items" on order_items
     for delete using (is_staff_of(restaurant_id));
+  create policy "staff_insert_order_items" on order_items
+    for insert with check (
+      is_staff_of(restaurant_id)
+      and exists (select 1 from orders o
+                  where o.id = order_items.order_id and o.restaurant_id = order_items.restaurant_id)
+    );
 
   create policy "staff_select_buttons" on hardware_buttons
     for select using (is_staff_of(restaurant_id));
@@ -425,7 +439,7 @@ Enum-типи: `staff_role` (admin, waiter), `table_status` (free, occupied), `s
     add table service_requests, orders, order_items, tables;
   ```
 
-  - Матриця доступів: гостьові INSERT (запити, замовлення) — ВИКЛЮЧНО service_role через API-routes фази 2; `admin_write_buttons` покриває insert/update/delete для адміна; `hardware_buttons.secret` недоступний anon (таблиця без anon-політик).
+  - Матриця доступів: INSERT сервісних запитів — ВИКЛЮЧНО service_role через guest/hardware API; INSERT `orders`/`order_items` — персонал свого ресторану (створення замовлень офіціантом, задача 3.5) або service_role; гість читає замовлення свого столу лише через `GET /api/table-orders` після валідації table-cookie (задача 2.3); `admin_write_buttons` покриває insert/update/delete для адміна; `hardware_buttons.secret` недоступний anon (таблиця без anon-політик).
   - Перегенерувати типи `database.types.ts`.
 
 - Acceptance Criteria:
@@ -433,6 +447,7 @@ Enum-типи: `staff_role` (admin, waiter), `table_status` (free, occupied), `s
   - Другий INSERT відкритого запиту того самого типу на той самий стіл падає з `23505` (unique violation).
   - Anon-клієнт: `select` з `tables`, `service_requests`, `orders`, `hardware_buttons` → 0 рядків; `select` з `menu_items` повертає лише `is_available = true`.
   - Authenticated без рядка в `staff_users` не бачить жодних операційних даних.
+  - Waiter може INSERT `orders`/`order_items` лише зі своїм `restaurant_id` і своїм столом; `table_id` чужого ресторану відхиляється (`with check`).
   - Типи перегенеровано; enum-значення доступні в TypeScript.
 
 ### Задача 1.4
@@ -451,7 +466,8 @@ Enum-типи: `staff_role` (admin, waiter), `table_status` (free, occupied), `s
     - staff через `supabase.auth.admin.createUser({ email, password, email_confirm: true })` + INSERT у `staff_users` (з колонкою `email`): `admin@demo-bistro.test` / `waiter@demo-bistro.test` (аналогічно для другого), пароль з env або константа для dev;
     - столи: 8 для першого, 4 для другого (`access_token` генерується DB default);
     - меню: 3–4 категорії, 12+ страв з цінами та описами, 2 страви з `is_available = false`, 1 неактивна категорія;
-    - 1 запис `hardware_buttons` для demo-bistro (для розробки фази 4).
+    - 1 запис `hardware_buttons` для demo-bistro (для розробки фази 4);
+    - 2 відкриті замовлення (`orders` зі статусами `new`/`in_progress` + `order_items` зі snapshot назв/цін) на столах demo-bistro — дані для гостьового перегляду замовленого (2.3) і дашборда (фаза 3).
   - Ідемпотентність: upsert за `slug` / `email` / `(restaurant_id, table_number)`; повторний запуск не створює дублікатів (для auth-користувачів — пошук через `listUsers` за email перед створенням).
   - У кінці друкує в консоль: креденшали персоналу, URL меню обох ресторанів, повні table-URL з токенами (`/r/{slug}/table/{n}?token={token}`).
 
@@ -545,7 +561,7 @@ Enum-типи: `staff_role` (admin, waiter), `table_status` (free, occupied), `s
 
 - Technical Implementation Details for AI:
   - `app/r/[slug]/page.tsx` — Server Component: один запит server-клієнтом (anon): `menu_categories` з вкладеними `menu_items` (`select('*, menu_items(*)')`), `order('sort_order')` для обох рівнів; RLS anon-політики самі відфільтрують неактивні категорії та недоступні страви. `restaurant` — з `getRestaurantBySlug` (кешовано в межах запиту, 1.7).
-  - Читання table-сесії: `cookies()` → `verifyTableSession` (з'явиться у 2.2; у цій задачі — заглушка, що повертає `null`), у клієнтські компоненти передається `tableSession: { tableId, tableNumber } | null`. Без сесії сторінка read-only: зони кошика і сервісних кнопок не рендеряться.
+  - Читання table-сесії: `cookies()` → `verifyTableSession` (з'явиться у 2.2; у цій задачі — заглушка, що повертає `null`), у клієнтські компоненти передається `tableSession: { tableId, tableNumber } | null`. Без сесії сторінка оглядова: сервісні кнопки і список замовленого не рендеряться.
   - UI (mobile-first, ширина від 360px):
     - sticky header з layout (лого + назва) + горизонтальна навігація категорій (chips зі scroll-to-anchor, `scroll-margin-top` на секціях);
     - секції категорій; `MenuItemCard`: фото (`next/image` з R2-хоста, `sizes`, lazy; без фото — placeholder-блок), назва, опис (`line-clamp-2`), ціна через `formatPrice`;
@@ -557,7 +573,7 @@ Enum-типи: `staff_role` (admin, waiter), `table_status` (free, occupied), `s
   - Меню обох seed-ресторанів рендериться з фото, описами й цінами у порядку `sort_order`.
   - Страви з `is_available = false` та неактивні категорії відсутні у HTML-відповіді (не просто приховані CSS).
   - Навігація категорій прокручує до відповідної секції; верстка коректна на 360px.
-  - Без table-сесії немає елементів кошика/сервісних кнопок.
+  - Без table-сесії немає сервісних кнопок і списку замовленого.
   - LCP на демо-даних у throttled mobile-профілі < 2.5s (перевірка Lighthouse).
 
 ### Задача 2.2
@@ -565,7 +581,7 @@ Enum-типи: `staff_role` (admin, waiter), `table_status` (free, occupied), `s
 - Title: Доступ до столу за токеном `/r/[slug]/table/[n]?token=` і підписана table-сесія
 
 - Goal / Description:
-  Як гість, я хочу відсканувати QR/NFC-мітку на столі й одразу отримати меню, прив'язане до мого столу, щоб мої виклики та замовлення приходили офіціанту з правильним номером столу. Як система, я хочу криптографічно валідувати посилання і сесію, щоб ніхто не міг створювати запити від імені чужого столу.
+  Як гість, я хочу відсканувати QR/NFC-мітку на столі й одразу отримати меню, прив'язане до мого столу, щоб мої виклики приходили офіціанту з правильним номером столу, а я бачив список замовленого саме свого столу. Як система, я хочу криптографічно валідувати посилання і сесію, щоб ніхто не міг створювати запити чи читати замовлення від імені чужого столу.
 
 - Technical Implementation Details for AI:
   - `src/lib/table-session.ts` (server-only):
@@ -578,7 +594,7 @@ Enum-типи: `staff_role` (admin, waiter), `table_status` (free, occupied), `s
     - порівняння токена: `crypto.timingSafeEqual` (після перевірки довжини);
     - успіх → `Set-Cookie ss_table` (`httpOnly`, `sameSite: 'lax'`, `secure` у production, `path: '/'`, `maxAge: 4h`) + redirect 303 на `getGuestBasePath(slug) || '/'` (на tenant-домені — `/`, на root-домені — `/r/{slug}`);
     - невдача (немає столу / токен не збігся / стіл або ресторан неактивні) → redirect на `{base}?e=invalid_table` БЕЗ cookie.
-  - Замінити заглушку в 2.1: сторінка меню читає cookie і викликає `verifyTableSession(value, restaurant.id)`; при валідній сесії показує badge «Стіл {tn}» у header і вмикає гостьові дії (2.3, 2.4).
+  - Замінити заглушку в 2.1: сторінка меню читає cookie і викликає `verifyTableSession(value, restaurant.id)`; при валідній сесії показує badge «Стіл {tn}» у header і вмикає гостьові блоки (список замовленого 2.3, сервісні кнопки 2.4).
   - Токен ніколи не потрапляє в client-side JS/localStorage — лише httpOnly cookie; наявність токена в URL QR-коду прийнятна (він фізично надрукований на столі).
 
 - Acceptance Criteria:
@@ -590,25 +606,28 @@ Enum-типи: `staff_role` (admin, waiter), `table_status` (free, occupied), `s
 
 ### Задача 2.3
 
-- Title: Локальний кошик гостя (context + localStorage + Sheet UI)
+- Title: Read-only список замовленого на столі для гостя + `GET /api/table-orders`
 
 - Goal / Description:
-  Як гість, я хочу додавати страви в кошик, змінювати кількість і бачити загальну суму, щоб сформувати замовлення перед відправкою офіціанту.
+  Як гість, я хочу бачити на своїй сторінці актуальний список замовленого на моєму столі (позиції, кількість, суму), який сформував офіціант, щоб у будь-який момент перевірити своє замовлення і майбутній рахунок без виклику персоналу.
 
 - Technical Implementation Details for AI:
-  - `components/guest/cart-context.tsx` (Client): `CartProvider` монтується з guest-layout лише за наявності валідної table-сесії; `useReducer` з діями `add | remove | setQty | clear`; елемент: `{ menuItemId, name, price, quantity }` (`price` — лише для відображення, сервер перерахує у 2.5); максимум 20 шт. на позицію.
-  - Персистентність: localStorage-ключ `ss_cart_{restaurantId}_{tableId}`; hydration-safe: initial state порожній, читання з localStorage у `useEffect`, запис — при кожній зміні. Кошики різних столів/ресторанів не перетинаються.
-  - UI:
-    - `AddToCartButton` у `MenuItemCard`: «Додати» → stepper `−/+` коли позиція вже в кошику;
-    - плаваючий `CartBar` знизу екрана (кількість позицій + сума + «Переглянути замовлення»), видимий лише при непорожньому кошику;
-    - `CartSheet` (shadcn Sheet bottom): список позицій (назва, ціна, stepper, видалити), `Textarea` «Коментар до замовлення» (max 500), загальна сума, кнопка «Надіслати замовлення» (submit підключить 2.5; тут — prop `onSubmit`).
-  - Всі суми — через `formatPrice`; без table-сесії компоненти кошика не рендеряться взагалі (узгоджено з 2.1).
+  - Модель: замовлення створює ЛИШЕ офіціант з дашборда (задача 3.5); гість нічого не пише — тільки читає список свого столу. У фазі 2 дані для розробки — seed-замовлення з 1.4.
+  - Спільний server-only хелпер `getOpenTableOrders(restaurantId, tableId)` (admin-клієнт): `orders` з `payment_status = 'unpaid'` і `status != 'cancelled'` для столу + їх `order_items`; повертає `{ orders: [{ id, status, createdAt, items: [{ itemName, quantity, unitPrice }] }], total }`, де `total = sum(unit_price × quantity)` по всіх позиціях.
+  - `GET /api/table-orders` (route handler): cookie `ss_table` → `verifyTableSession` → 401 якщо відсутня/невалідна; `restaurant_id`/`table_id` ВИКЛЮЧНО з cookie (жодних параметрів у query); відповідь — результат `getOpenTableOrders`; інші методи → 405.
+  - RLS для anon НЕ відкривається: `orders`/`order_items` лишаються недоступними анонімному клієнту — гість читає їх тільки через цей endpoint після криптографічної валідації cookie.
+  - UI `components/guest/table-orders.tsx` (Client) + серверний initial render:
+    - сторінка меню (2.1) при валідній table-сесії викликає `getOpenTableOrders` server-side і передає початкові дані;
+    - плаваючий `TableOrdersBar` знизу екрана («Замовлено: N позицій · {сума}»), видимий лише при непорожньому списку → відкриває `TableOrdersSheet` (shadcn Sheet bottom): позиції, згруповані за замовленнями (`item_name`, `quantity × unit_price`, сума рядка), статус замовлення українською («Прийнято» / «Готується»), загальна сума, кнопка «Оновити»;
+    - актуалізація: поллінг `GET /api/table-orders` кожні 30 с (пауза, коли вкладка прихована — `document.visibilityState`) + ручна кнопка «Оновити»; Supabase Realtime для anon недоступний через RLS — поллінг є свідомим MVP-рішенням.
+  - Всі суми — через `formatPrice`; мапа статусів на українські лейбли — в одному місці (`lib/format.ts`).
 
 - Acceptance Criteria:
-  - Додавання/зміна кількості/видалення миттєво оновлюють CartBar і суму.
-  - Кошик переживає reload сторінки (localStorage) і не змішується між двома столами/ресторанами у тому самому браузері.
-  - Ліміт 20 шт. на позицію дотримується; порожній кошик ховає CartBar.
-  - Жодних hydration-помилок у консолі.
+  - Гість з валідною table-сесією бачить список замовленого свого столу (позиції, кількість, ціни, загальна сума) — на seed-даних, а після 3.5 — наживо.
+  - Коригування цін/складу офіціантом видно гостю після поллінгу (≤ 30 с) або натискання «Оновити».
+  - Після закриття столу (`close_table`, задача 3.6) список порожніє і бар зникає.
+  - `GET /api/table-orders` без cookie / з підробленою або простроченою cookie → 401; повертаються лише замовлення столу з cookie (чужий стіл недосяжний за побудовою).
+  - Без table-сесії блок не рендериться; прямий anon-доступ до `orders`/`order_items` лишається закритим (RLS).
 
 ### Задача 2.4
 
@@ -632,29 +651,6 @@ Enum-типи: `staff_role` (admin, waiter), `table_status` (free, occupied), `s
   - Стіл переходить у `occupied` після першого запиту.
   - Прямий POST без cookie (або з підробленою) → 401; підміна id у body неможлива (body id відсутні в контракті).
   - Cooldown блокує спам-кліки на клієнті; кнопки не рендеряться без table-сесії.
-
-### Задача 2.5
-
-- Title: Відправка замовлення + `POST /api/orders` зі server-side snapshot цін
-
-- Goal / Description:
-  Як гість, я хочу надіслати сформоване замовлення з кошика, щоб офіціант миттєво його побачив. Як система, я хочу розраховувати назви й ціни виключно на сервері з БД, щоб гість не міг маніпулювати вартістю замовлення.
-
-- Technical Implementation Details for AI:
-  - `app/api/orders/route.ts` (POST):
-    - zod body: `{ items: [{ menuItemId: uuid, quantity: int 1..20 }] (1..50 елементів), comment?: string ≤ 500 }`; дублікати `menuItemId` зливаються з сумуванням quantity;
-    - контекст лише з cookie: `verifyTableSession` → 401;
-    - admin-клієнт: `SELECT id, name, price FROM menu_items WHERE id IN (...) AND restaurant_id = {rid} AND is_available` — якщо хоч один id не знайдено → 400 `{ error: 'items_unavailable', missing: [...] }` (захист від чужих/прихованих страв);
-    - INSERT `orders { restaurant_id, table_id, status: 'new', payment_status: 'unpaid', guest_comment }` → bulk INSERT `order_items { restaurant_id, order_id, menu_item_id, item_name: name, unit_price: price, quantity }` (значення ТІЛЬКИ з БД, ціни з клієнта ігноруються); при збої вставки позицій — компенсаційний `DELETE order` (щоб не було порожніх замовлень);
-    - `UPDATE tables SET status='occupied'`; відповідь 201 `{ orderId, total }` (total рахує сервер).
-  - UI: `CartSheet.onSubmit` → fetch POST → loading; успіх → екран/стан підтвердження (іконка, «Замовлення передано», список позицій + сума) → `clear` кошика (включно з localStorage); помилка `items_unavailable` → toast «Деякі страви вже недоступні», видалення недоступних позицій з кошика + `router.refresh()` для оновлення меню.
-
-- Acceptance Criteria:
-  - Замовлення створює `orders` + `order_items` зі snapshot назв/цін саме з БД: підміна ціни в localStorage/devtools не впливає на збережені значення.
-  - `total` у відповіді = `sum(unit_price × quantity)` вставлених рядків.
-  - Недоступна/чужа страва в кошику → 400 без часткових вставок (компенсація відпрацьовує, порожніх orders немає).
-  - Кошик очищується після успіху; `guest_comment` зберігається.
-  - POST без валідної table-сесії → 401.
 
 ---
 
@@ -699,7 +695,7 @@ Enum-типи: `staff_role` (admin, waiter), `table_status` (free, occupied), `s
   - Стійкість: `.subscribe(status => ...)`: на `'CHANNEL_ERROR' | 'TIMED_OUT'` — індикатор з'єднання червоний; на відновлення `'SUBSCRIBED'` після обриву → розіслати `'resync'` (сторінки перезавантажують дані). Індикатор з'єднання (зелена/сіра/червона крапка) в header.
 
 - Acceptance Criteria:
-  - Створення сервісного запиту гостем (другий браузер/інкогніто) → toast + звук на дашборді < 2 с; те саме для замовлення.
+  - Створення сервісного запиту гостем (другий браузер/інкогніто) → toast + звук на дашборді < 2 с; замовлення, створене офіціантом з іншого пристрою, → toast + звук у решти персоналу.
   - Waiter ресторану A не отримує подій ресторану B (перевірити двома залогіненими вкладками).
   - Звук вмикається лише після взаємодії з toggle; стан переживає reload; при вимкненому звуці алерти лише візуальні.
   - Відключення мережі на ~10 с → індикатор червоніє; після відновлення дані ресинхронізуються без reload сторінки.
@@ -715,12 +711,12 @@ Enum-типи: `staff_role` (admin, waiter), `table_status` (free, occupied), `s
 - Technical Implementation Details for AI:
   - `/dashboard/page.tsx` (RSC): initial fetch server-клієнтом (RLS): активні `tables` (order by `table_number`) + відкриті `service_requests` + `orders` зі статусами `new`/`in_progress` разом з `order_items` (для сум) → передати в `TablesBoard` (Client).
   - `TableCard`: номер + label; колір за `status` (`free` — нейтральний, `occupied` — акцент); badges: «Виклик» (pulse-анімація + час найстарішого відкритого виклику), «Рахунок», «Замовлень: N»; сума відкритих замовлень столу (`formatPrice`). Відносний час («5 хв тому») оновлюється інтервалом 30 с.
-  - Клік по картці → `TableDetailSheet`: відкриті запити столу з кнопкою «Обробити» (та сама мутація, що у 3.4), список замовлень столу (статус, сума; деталі — компонент 3.5), кнопка «Закрити стіл» (підключить 3.6, поки disabled з tooltip).
+  - Клік по картці → `TableDetailSheet`: відкриті запити столу з кнопкою «Обробити» (та сама мутація, що у 3.4), список замовлень столу (статус, сума; деталі — компонент 3.5), кнопки «Нове замовлення» (перехід на створення з передвибраним столом, підключить 3.5) і «Закрити стіл» (підключить 3.6, поки disabled з tooltip).
   - Realtime: `useRealtimeEvents` для `service_requests` / `orders` / `order_items` / `tables` → інкрементальне оновлення локальної `Map` по `table_id`; подія `'resync'` → повний refetch клієнтським supabase-клієнтом (RLS) через функцію `loadBoard()`.
   - Grid-сортування стабільне за `table_number` (без перестрибувань); привертання уваги — лише підсвіткою і badges.
 
 - Acceptance Criteria:
-  - Запит/замовлення гостя миттєво (< 2 с) підсвічує відповідний стіл без reload.
+  - Сервісний запит гостя або замовлення, створене колегою, миттєво (< 2 с) підсвічує відповідний стіл без reload.
   - `free`/`occupied` і суми відкритих замовлень відображаються коректно.
   - Деталі столу відкриваються з актуальними даними; «Обробити» працює звідси (після 3.4).
   - Таймери «N хв тому» оновлюються; порядок карток стабільний.
@@ -749,24 +745,29 @@ Enum-типи: `staff_role` (admin, waiter), `table_status` (free, occupied), `s
 
 ### Задача 3.5
 
-- Title: Управління замовленнями — статуси та ручне редагування цін позицій
+- Title: Створення замовлень офіціантом та управління ними (статуси, редагування цін)
 
 - Goal / Description:
-  Як офіціант, я хочу переглядати замовлення з позиціями, змінювати їх статус і вручну коригувати ціни/кількість/склад, щоб рахунок відповідав реальності (акції, заміни, домовленості з гостем).
+  Як офіціант, я хочу формувати замовлення столу, обираючи страви з меню (гість озвучує замовлення мені), а також змінювати статус замовлень і вручну коригувати ціни/кількість/склад, щоб список замовленого й майбутній рахунок завжди відповідали реальності, а гість бачив їх на своїй сторінці (задача 2.3).
 
 - Technical Implementation Details for AI:
-  - `/dashboard/orders/page.tsx`: Tabs «Нові (N)» / «В роботі» / «Завершені сьогодні»; RSC initial fetch: `orders` + `order_items` + `tables(table_number)` свого ресторану → `OrdersList` (Client).
+  - Створення замовлення — `/dashboard/orders/new?table={tableId}` (входи: кнопка «Нове замовлення» на сторінці замовлень і в `TableDetailSheet` 3.3 з передвибраним столом):
+    - Select столу (активні столи ресторану, клієнтський supabase, RLS);
+    - пікер страв: категорії (Tabs/Accordion) + пошук за назвою (клієнтська фільтрація); дані меню — fetch `menu_categories`/`menu_items` з `is_available = true` (staff-політики RLS); тап по страві додає позицію, stepper кількості (1..50);
+    - зведення замовлення: позиції, кількість, сума (`formatPrice`), `Textarea` `note` (нотатка офіціанта, ≤ 500);
+    - «Створити замовлення» → browser-клієнт: INSERT `orders { restaurant_id, table_id, status: 'new', payment_status: 'unpaid', note }` + bulk INSERT `order_items { restaurant_id, order_id, menu_item_id, item_name, unit_price, quantity }` — snapshot назв/цін береться з завантажених із БД `menu_items`; політики `staff_insert_orders` / `staff_insert_order_items` (1.3) гарантують tenant-межі; далі `UPDATE tables SET status='occupied'`; при збої вставки позицій — компенсаційний DELETE замовлення (без порожніх orders); редірект на `/dashboard/orders`.
+  - Управління — `/dashboard/orders/page.tsx`: Tabs «Нові (N)» / «В роботі» / «Завершені сьогодні» + кнопка «Нове замовлення»; RSC initial fetch: `orders` + `order_items` + `tables(table_number)` свого ресторану → `OrdersList` (Client).
   - `OrderCard`: «Стіл {n}», час створення, кількість позицій, сума (`sum(unit_price × quantity)` рахується з items на клієнті), поточний статус; кнопка «Прийняти» на `new` (→ `in_progress`); Select статусу (`new → in_progress → completed / cancelled`) — клієнтський supabase update (RLS), optimistic.
-  - `OrderDetailSheet` (перевикористовується у 3.3): `guest_comment`, список позицій: `item_name` (snapshot), stepper `quantity` (1..50), інлайн-редагування `unit_price` (numeric input ≥ 0, крок 0.01), «Прибрати позицію» (delete з confirm-dialog); мутації — клієнтський supabase `update`/`delete` на `order_items` (політики `staff_update_order_items` / `staff_delete_order_items`); сума перераховується миттєво.
+  - `OrderDetailSheet` (перевикористовується у 3.3): `note`, список позицій: `item_name` (snapshot), stepper `quantity` (1..50), інлайн-редагування `unit_price` (numeric input ≥ 0, крок 0.01), «Прибрати позицію» (delete з confirm-dialog); мутації — клієнтський supabase `update`/`delete` на `order_items` (політики `staff_update_order_items` / `staff_delete_order_items`); сума перераховується миттєво.
   - Валідація: zod на клієнті + DB check-constraints (`unit_price >= 0`, `quantity 1..50`) як друга лінія.
   - Realtime: INSERT `orders` → prepend у «Нові» (глобальний toast уже робить 3.2); UPDATE `orders`/`order_items` → синхронізація списку і відкритого Sheet (редагування колегою видно live); `'resync'` → refetch.
 
 - Acceptance Criteria:
-  - Нове замовлення гостя з'являється у «Нових» < 2 с без reload.
-  - Зміна `unit_price`/`quantity` зберігається в БД; сума перераховується у списку, деталях і на картці столу (3.3).
-  - Зміна статусу синхронізується між двома відкритими дашбордами; «Завершені сьогодні» показує завершені/скасовані.
-  - Видалення позиції вимагає підтвердження і працює; замовлення без позицій показує 0 суму (не ламається).
-  - Спроба редагувати order_item чужого ресторану неможлива (RLS; фінальна перевірка — скрипт 4.5).
+  - Офіціант створює замовлення столу з пікера меню за кілька дотиків; воно з'являється у «Нових», на картці столу (3.3) і в гостьовому списку замовленого (2.3, після поллінгу або «Оновити»).
+  - `order_items` містять snapshot назв/цін з БД на момент створення; подальше редагування меню не змінює відкриті замовлення.
+  - INSERT замовлення з `table_id` чужого ресторану неможливий (RLS `with check`; фінальна перевірка — скрипт 4.5).
+  - Зміна `unit_price`/`quantity`/статусу синхронізується між двома відкритими дашбордами < 2 с; сума перераховується у списку, деталях, на картці столу і в гостя; видалення позиції вимагає підтвердження.
+  - «Завершені сьогодні» показує завершені/скасовані; замовлення без позицій показує 0 суму (не ламається); при збої вставки позицій не лишається порожнє замовлення.
 
 ### Задача 3.6
 
@@ -961,7 +962,7 @@ Enum-типи: `staff_role` (admin, waiter), `table_status` (free, occupied), `s
 
 - Acceptance Criteria:
   - `https://{ROOT_DOMAIN}/r/demo-bistro` і `https://demo-bistro.{ROOT_DOMAIN}` віддають брендоване меню.
-  - Повний цикл гість → офіціант працює на проді: виклик, замовлення, realtime-алерт зі звуком, обробка, закриття столу.
+  - Повний цикл працює на проді: виклик гостя → realtime-алерт зі звуком → створення замовлення офіціантом → оновлення списку замовленого у гостя → закриття столу зі способом оплати.
   - Невідомий піддомен → сторінка `domain-not-found`; фото меню віддаються з R2 по HTTPS і рендеряться.
   - Завантаження фото працює з прод-дашборда (CORS правильний).
   - Усі cookies на проді `Secure` + `HttpOnly`; TLS активний для apex, www і wildcard.
@@ -1003,9 +1004,9 @@ Enum-типи: `staff_role` (admin, waiter), `table_status` (free, occupied), `s
 - Technical Implementation Details for AI:
   - `scripts/security-check.ts` (`pnpm security:check`; env-параметри: base URL + креденшали seed-акаунтів обох ресторанів; працює і локально, і проти staging/prod). Кожна перевірка — assert очікуваної ВІДМОВИ або успіху; вивід — таблиця PASS/FAIL; ненульовий exit code при будь-якому FAIL:
     1. **anon**: `select` з `tables`, `service_requests`, `orders`, `order_items`, `staff_users`, `hardware_buttons` → 0 рядків; прямий `insert` у `service_requests`/`orders` → RLS-помилка; `select restaurants/menu_items` → лише активні/доступні.
-    2. **waiter A проти tenant B**: `select`/`update` чужих `service_requests`/`orders`/`order_items`/`tables` → 0 рядків / 0 affected; `rpc close_table` зі столом B → `forbidden`.
+    2. **waiter A проти tenant B**: `select`/`update` чужих `service_requests`/`orders`/`order_items`/`tables` → 0 рядків / 0 affected; `insert` замовлення з `table_id` ресторану B → RLS-помилка; `rpc close_table` зі столом B → `forbidden`.
     3. **ролі**: waiter A `insert/update` у `menu_items`/`menu_categories`/`hardware_buttons` свого ресторану → RLS-помилка (лише admin); admin A не може писати `restaurant_branding`/`staff_users` ресторану B.
-    4. **guest API**: POST `/api/service-requests` і `/api/orders` без cookie → 401; з cookie з підробленим підписом → 401; з простроченим `exp` → 401; `/api/orders` з `menu_item_id` чужого ресторану → 400.
+    4. **guest API**: POST `/api/service-requests` і GET `/api/table-orders` без cookie → 401; з cookie з підробленим підписом → 401; з простроченим `exp` → 401; `/api/table-orders` повертає ЛИШЕ замовлення столу з cookie (замовлення інших столів у відповіді відсутні).
     5. **table URL**: невірний token → відповідь без `Set-Cookie`; неактивний стіл → відмова.
     6. **hardware**: невірний секрет / невідомий `button_id` → 401 (ідентичні); неактивна кнопка → 403; повторний виклик → без другого відкритого рядка.
     7. **uploads**: `/api/uploads/presign` без сесії → 401, під waiter → 403.
@@ -1030,8 +1031,8 @@ Enum-типи: `staff_role` (admin, waiter), `table_status` (free, occupied), `s
 
 MVP вважається завершеним, коли на production одночасно виконується:
 
-- [ ] Гість сканує QR/NFC → бачить брендоване меню свого закладу → кличе офіціанта / просить рахунок → надсилає замовлення (без оплати онлайн).
-- [ ] Офіціант на дашборді отримує звуковий і візуальний алерт < 2 с, бачить активні столи, обробляє запити, коригує ціни позицій, закриває стіл із способом оплати (cash / terminal / paid_manually).
+- [ ] Гість сканує QR/NFC → бачить брендоване меню свого закладу → кличе офіціанта / просить рахунок → бачить актуальний список замовленого на своєму столі та суму (замовлення формує офіціант; онлайн-оплати немає).
+- [ ] Офіціант на дашборді отримує звуковий і візуальний алерт < 2 с, бачить активні столи, обробляє запити, створює замовлення столу з меню, коригує ціни позицій, закриває стіл із способом оплати (cash / terminal / paid_manually).
 - [ ] Фізична кнопка через `POST /api/hardware-call` створює той самий сервісний запит, що й цифрова.
 - [ ] Ресторани працюють на `{slug}.platform.com` і на власних custom-доменах; брендинг (колір, лого, шрифт) — індивідуальний для кожного tenant'а.
 - [ ] Адмін закладу самостійно керує меню (з фото на R2), столами (QR/токени), персоналом, брендингом, hardware-кнопками і доменом.
